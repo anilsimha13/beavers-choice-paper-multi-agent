@@ -1,0 +1,11 @@
+# Secrets
+.env
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Generated at runtime (recreated by init_database)
+munder_difflin.db
