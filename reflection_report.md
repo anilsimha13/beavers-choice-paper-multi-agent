@@ -42,7 +42,8 @@ The system has five agents, the maximum allowed. Each one owns a distinct part o
 5. **Sales → Inventory hand-off (PROCURE).** After a confirmed sale, the Inventory Agent buys the back-ordered shortfall (`procure_backordered_items`, which records `stock_orders`). It then applies a reorder-point policy (`replenish_low_stock_items`): any regular item below its `min_stock_level` is topped up to 3× that minimum, provided the purchase doesn't breach the cash reserve.
 6. The **Orchestrator** writes the reply. An output validator rejects the reply and makes the agent retry if any of these are true:
    - A step of the procedure was skipped.
-   - The order reference, a unit price or the exact total is missing.
+   - The order reference, a unit price with its basis ("per sheet" or "per unit"), a line subtotal, the bulk discount amount or the exact total is missing.
+   - An item ordered in reams, boxes or packs is missing its unit conversion (for example, "500 reams x 500 sheets per ream = 250,000 sheets") or its equivalent package price ("$25.00 per ream").
    - The reply contains internal terms (cost, margin, markup, cash balance and similar) or placeholders such as `[Your Name]`.
 7. After all requests, the **Business Advisor** reads the outcome log, the financial report (`generate_financial_report`) and the inventory snapshot (`get_all_inventory`). It writes `business_advisor_report.md`.
 
@@ -76,16 +77,16 @@ All 20 requests in `quote_requests_sample.csv` were processed in a single run, w
 | Metric | Result |
 |---|---|
 | Requests that changed the cash balance | **18 / 20** |
-| Requests fully fulfilled | **7** (requests 1, 4, 5, 6, 10, 12, 13) |
-| Requests partially fulfilled (some lines confirmed, others refused with reasons) | **11** (2, 3, 7, 8, 9, 11, 14, 16, 17, 19, 20) |
+| Requests fully fulfilled | **7** (requests 1, 4, 5, 6, 10, 11, 12) |
+| Requests partially fulfilled (some lines confirmed, others refused with reasons) | **11** (2, 3, 7, 8, 9, 13, 14, 16, 17, 19, 20) |
 | Requests not fulfilled, with reasons given | **2** (15, 18) |
 | Order lines fulfilled | 36 of 60 (60%) |
-| Lines not fulfilled | 13 not carried, 11 could not meet the deadline |
-| Sales revenue | $14,990.50 from 36 sales transactions |
-| Gross profit on goods sold | $1,170.00 |
-| Cash, 1 Apr → 17 Apr | $45,059.70 → $46,684.90 (**+$1,625.20**) |
+| Lines not fulfilled | 12 not carried, 12 could not meet the deadline |
+| Sales revenue | $15,002.50 from 36 sales transactions |
+| Gross profit on goods sold | $1,172.00 |
+| Cash, 1 Apr → 17 Apr | $45,059.70 → $46,686.90 (**+$1,627.20**) |
 | Inventory value | $4,940.30 → $4,485.10 (stock sold and partly replenished) |
-| Supplier purchases | 37 `stock_orders` transactions ($13,365.30): back-orders and replenishment |
+| Supplier purchases | 38 `stock_orders` transactions ($13,375.30): back-orders and replenishment |
 
 **Rubric checks:**
 - At least three requests changed cash: 18 did.
@@ -98,19 +99,18 @@ All 20 requests in `quote_requests_sample.csv` were processed in a single run, w
    - Request 15 (12 Apr: 10,000 A4 sheets by 15 Apr) needs a 7-day supplier lead time, so it can't arrive before 20 Apr. The customer is told this and offered the units already on hand. A3 paper and cardboard are explained as not part of the product range.
    - Request 18 (14 Apr, needed by 15 Apr) is refused line by line. Each line gets the earliest possible date and a reduced-quantity alternative.
 2. **Partial fulfilment instead of all-or-nothing.** Customers get whatever can be delivered on time. Each refused line has its own reason: "not part of our product range" for balloons, A3, A5 and tickets, or "would only reach you by X, after your requested date of Y".
-3. **Accurate, transparent pricing.** Every confirmed order lists unit prices, line subtotals, the bulk-discount tier and why it applies, the courtesy rounding, the total and the delivery date.
-   - Request 3 (10,000 A4 sheets + 250,000 copy-paper sheets) earned the 15% tier: $13,125.00 → $11,156.00.
-   - Request 9's reply tells the customer how many more units would unlock the next tier.
+3. **Accurate, transparent pricing.** Every confirmed order lists each unit price with its basis ("per sheet" or "per unit"), each line subtotal as a calculation, the bulk-discount tier and amount, the courtesy rounding, the total and the delivery date.
+   - Request 3 asked for "500 reams of printer paper". The reply shows the conversion and the price basis so the customer can check the figure: "500 reams x 500 sheets per ream = 250,000 sheets", "$0.05 per sheet (equivalent to $25.00 per ream)" and "250,000 sheets x $0.05 per sheet = $12,500.00". With the 10,000 A4 sheets, the order earned the 15% tier: $13,125.00 − $1,968.75 (15%) − $0.25 courtesy rounding = $11,156.00.
 4. **Back-order and replenishment logic.** Large orders such as request 3 were met through supplier back-orders within the deadline. Each sale triggered a reorder-point check, so regular items didn't sit below their minimum level. The financial health check ran before every large or restock order.
 5. **Confidentiality.** No reply mentions costs, margins, the cash balance or internal errors. An automated scan of all 20 responses found no internal terms and no placeholders.
 6. **Resilience.** An earlier attempt hit a temporary HTTP 404 from the API proxy. That led to retry logic that only restarts a request when nothing has been written to the ledger, plus a safe fallback reply. The final run completed cleanly.
 
 ### 2.2 Areas for improvement found in the results
 
-- **Thin margins on back-ordered goods.** Restocked items are sold at only about 6–25% above cost. Request 3, for example, brought in $11,156 of revenue for roughly $10,500 of procurement. Cash grew by only $1,625 across 18 sales.
+- **Thin margins on back-ordered goods.** Restocked items are sold at only about 6–25% above cost. Request 3, for example, brought in $11,156 of revenue for roughly $10,500 of procurement. Cash grew by only $1,627 across 18 sales.
 - **Lead times ignore stock already on order.** A supplier order counts as stock from the moment it is placed, and replenishment orders are dated the day they are placed. The customer delivery date does respect the supplier lead time, but a later request may be promised stock that is still in transit.
-- **Item mapping is decided by the LLM.** Small inconsistencies remain. "Poster boards (24×36)" was mapped to *Large poster paper* in request 7, but treated as not carried in request 16. "Kraft paper envelopes" counted as not carried in request 9 even though the catalog has *Envelopes*.
-- **Minor wording inconsistencies.** Request 9's reply gives two different delivery dates (9 and 10 April). The data passed to the agent was correct; the LLM restated it inconsistently.
+- **Item mapping is decided by the LLM.** Small inconsistencies remain. "Poster boards (24×36)" was mapped to *Large poster paper* in request 7, but treated as not carried in request 16.
+- **Upsell hints are not guaranteed.** The quote data includes the next discount tier, but whether the reply mentions it is left to the LLM. In this run, no reply did.
 - **Some replies reveal stock counts.** For lines past the deadline, replies say how many units are on hand (for example, "405 sheets"). That helps the customer but discloses inventory levels.
 
 ---
@@ -136,10 +136,12 @@ All 20 requests in `quote_requests_sample.csv` were processed in a single run, w
 
 - **Transparent, explainable outputs.** Customer replies include everything relevant to the request:
   - per-item status and delivery date
-  - unit prices, line subtotals, the discount tier and why it applies, and the total
+  - unit prices with their basis (per sheet or per unit), and each line subtotal shown as a calculation
+  - for items ordered in reams, boxes or packs, the conversion to sheets and the equivalent package price
+  - the discount tier, why it applies and how it was calculated, and the total
   - a reason for every item that can't be supplied
 
-  The output validator enforces the order reference, every unit price and the exact total.
+  The output validator enforces the order reference, every unit price with its basis, every unit conversion, the line subtotals, the discount amount and the exact total.
 - **No sensitive information.** Customers never see costs, margins, markup, the cash balance, supplier details or internal errors. The validator blocks such terms, the data sent to the orchestrator is a customer-safe view, and exceptions are logged internally while the customer gets a polite fallback. No customer personal data is stored or repeated.
 - **Readable, modular code.** `project_starter.py` contains the unchanged starter helpers followed by clearly separated sections: configuration and business policy, tracing, data models, deterministic domain services, agent prompts, agent definitions, per-agent tools, the multi-agent system class, and the evaluation harness. Naming is consistent (snake_case for functions, PascalCase for classes, UPPER_CASE for policy constants). Every tool and service has a docstring, and comments explain the business rules.
 

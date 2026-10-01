@@ -698,6 +698,15 @@ REORDER_UP_TO_MULTIPLIER = 3          # replenish stocked items up to 3x their m
 UNITS_PER_REAM = 500
 DEFAULT_UNITS_PER_BOX = 5_000         # a case/box of paper = 10 reams
 DEFAULT_UNITS_PER_PACK = 100
+PACKAGE_UNITS = [                     # (keyword in the customer's unit, default units per package)
+    ("ream", UNITS_PER_REAM),
+    ("box", DEFAULT_UNITS_PER_BOX),
+    ("case", DEFAULT_UNITS_PER_BOX),
+    ("carton", DEFAULT_UNITS_PER_BOX),
+    ("packet", DEFAULT_UNITS_PER_PACK),
+    ("pack", DEFAULT_UNITS_PER_PACK),
+]
+SHEET_PRICED_CATEGORIES = {"paper", "specialty"}
 
 CATALOG: dict[str, dict] = {item["item_name"]: item for item in paper_supplies}
 CATALOG_BY_LOWER_NAME: dict[str, str] = {name.lower(): name for name in CATALOG}
@@ -804,14 +813,44 @@ class RequestedItem(BaseModel):
     catalog_item: Optional[str] = Field(default=None, description="Exact name of the matching catalog item, or null if no catalog item genuinely matches.")
 
 
-class FulfillmentLine(BaseModel):
+def pluralize(word: str, count: int) -> str:
+    if count == 1:
+        return word
+    return word + "es" if word.endswith(("x", "s")) else word + "s"
+
+
+class LineQuantity(BaseModel):
+    """Quantity of an order line in pricing units, plus the customer's original package unit."""
+
+    quantity: int                      # in pricing units (sheets / units)
+    pricing_unit: str = "unit"         # "sheet" or "unit" - the basis of the unit price
+    requested_quantity: int = 0        # as stated by the customer, e.g. 500 (reams)
+    package_unit: str = ""             # "ream", "box", ... or "" when ordered in single units
+    units_per_package: int = 1
+
+    @property
+    def quantity_text(self) -> str:
+        return f"{self.quantity:,} {pluralize(self.pricing_unit, self.quantity)}"
+
+    @property
+    def quantity_note(self) -> str:
+        """Conversion shown to the customer, e.g. '500 reams x 500 sheets per ream = 250,000 sheets'."""
+        if not self.package_unit:
+            return ""
+        return (f"{self.requested_quantity:,} {pluralize(self.package_unit, self.requested_quantity)} x "
+                f"{self.per_package_text} = {self.quantity_text}")
+
+    @property
+    def per_package_text(self) -> str:
+        return f"{self.units_per_package:,} {pluralize(self.pricing_unit, self.units_per_package)} per {self.package_unit}"
+
+
+class FulfillmentLine(LineQuantity):
     """An order line enriched with the inventory agent's assessment."""
 
     line_id: int
     customer_description: str
     catalog_item: Optional[str]
-    quantity: int                      # in catalog units (sheets / units)
-    quantity_note: str = ""            # explains unit conversions, e.g. "500 reams x 500 sheets"
     unit_cost: float = 0.0             # internal
     is_stocked_item: bool = False      # part of the regular inventory range
     stock_on_hand: int = 0             # internal
@@ -827,14 +866,27 @@ class FulfillmentLine(BaseModel):
         return self.status in FULFILLABLE_STATUSES
 
 
-class QuoteLine(BaseModel):
+class QuoteLine(LineQuantity):
     catalog_item: str
     customer_description: str
-    quantity: int
-    list_unit_price: float
+    list_unit_price: float             # per pricing unit
     line_subtotal: float
     line_total: float                  # after discount and rounding, used for the sale record
     unit_cost: float                   # internal
+
+    @property
+    def unit_price_text(self) -> str:
+        return f"{format_unit_price(self.list_unit_price)} per {self.pricing_unit}"
+
+    @property
+    def package_price_text(self) -> str:
+        if not self.package_unit:
+            return ""
+        return f"{format_unit_price(self.list_unit_price * self.units_per_package)} per {self.package_unit}"
+
+    @property
+    def subtotal_calculation(self) -> str:
+        return f"{self.quantity_text} x {self.unit_price_text} = {format_money(self.line_subtotal)}"
 
 
 class Quote(BaseModel):
@@ -959,24 +1011,27 @@ def resolve_catalog_item(candidate: Optional[str]) -> Optional[str]:
     return CATALOG_BY_LOWER_NAME[close[0]] if close else None
 
 
-def convert_to_catalog_units(item: RequestedItem) -> tuple[int, str]:
-    """Convert a customer quantity into catalog units (sheets / single units).
+def pricing_unit_for(catalog_item: Optional[str]) -> str:
+    """Paper is priced per sheet, everything else per single unit."""
+    if catalog_item and CATALOG[catalog_item]["category"] in SHEET_PRICED_CATEGORIES:
+        return "sheet"
+    return "unit"
+
+
+def convert_to_catalog_units(item: RequestedItem) -> tuple[int, str, int]:
+    """Convert a customer quantity into pricing units (sheets / single units).
 
     Returns:
-        (quantity_in_catalog_units, human readable note about the conversion)
+        (quantity_in_pricing_units, package_unit or "", units_per_package)
     """
     unit = item.unit.strip().lower()
-    if "ream" in unit:
-        per_package = item.units_per_package or UNITS_PER_REAM
-    elif "box" in unit or "case" in unit or "carton" in unit:
-        per_package = item.units_per_package or DEFAULT_UNITS_PER_BOX
-    elif "pack" in unit:
-        per_package = item.units_per_package or DEFAULT_UNITS_PER_PACK
-    else:
-        per_package = 1
-    if per_package == 1:
-        return item.quantity, ""
-    return item.quantity * per_package, f"{item.quantity:,} {item.unit} x {per_package:,} units each"
+    for keyword, default_size in PACKAGE_UNITS:
+        if keyword in unit:
+            per_package = item.units_per_package or default_size
+            if per_package > 1:
+                return item.quantity * per_package, keyword, per_package
+            break
+    return item.quantity, "", 1
 
 
 # -----------------------------------------------------------------------------
@@ -988,13 +1043,16 @@ def build_order_lines(items: list[RequestedItem]) -> list[FulfillmentLine]:
     lines = []
     for line_id, item in enumerate(items, start=1):
         catalog_item = resolve_catalog_item(item.catalog_item)
-        quantity, quantity_note = convert_to_catalog_units(item)
+        quantity, package_unit, units_per_package = convert_to_catalog_units(item)
         lines.append(FulfillmentLine(
             line_id=line_id,
             customer_description=item.customer_description,
             catalog_item=catalog_item,
             quantity=quantity,
-            quantity_note=quantity_note,
+            pricing_unit=pricing_unit_for(catalog_item),
+            requested_quantity=item.quantity,
+            package_unit=package_unit,
+            units_per_package=units_per_package,
             unit_cost=CATALOG[catalog_item]["unit_price"] if catalog_item else 0.0,
             is_stocked_item=catalog_item in stocked_items,
         ))
@@ -1037,7 +1095,8 @@ def assess_fulfillment(order: OrderContext) -> None:
             line.status = STATUS_MISSES_DEADLINE
             partial_hint = ""
             if 0 < available < line.quantity and in_stock_delivery <= order.delivery_deadline:
-                partial_hint = f" We could deliver {available:,} units by {order.delivery_deadline} if a reduced quantity would help."
+                partial_hint = (f" We could deliver {available:,} {pluralize(line.pricing_unit, available)} "
+                                f"by {order.delivery_deadline} if a reduced quantity would help.")
             line.customer_reason = (
                 f"The full quantity would only reach you by {line.estimated_delivery}, "
                 f"after your requested delivery date of {order.delivery_deadline}.{partial_hint}"
@@ -1086,6 +1145,10 @@ def build_quote(order: OrderContext) -> Quote:
             catalog_item=line.catalog_item,
             customer_description=line.customer_description,
             quantity=line.quantity,
+            pricing_unit=line.pricing_unit,
+            requested_quantity=line.requested_quantity,
+            package_unit=line.package_unit,
+            units_per_package=line.units_per_package,
             list_unit_price=list_unit_price,
             line_subtotal=round(list_unit_price * line.quantity, 2),
             line_total=0.0,
@@ -1126,29 +1189,54 @@ def build_quote(order: OrderContext) -> Quote:
     )
 
 
+def discount_calculation(quote: Quote) -> str:
+    if not quote.discount_rate:
+        return f"no bulk discount (order below {BULK_DISCOUNT_TIERS[-1][0]:,} units)"
+    return (f"{quote.discount_rate:.0%} of {format_money(quote.subtotal)} = {format_money(quote.discount_amount)} "
+            f"({quote.total_units:,} units in the order)")
+
+
+def total_calculation(quote: Quote) -> str:
+    text_value = format_money(quote.subtotal)
+    if quote.discount_amount:
+        text_value += f" - {format_money(quote.discount_amount)} bulk discount"
+    if quote.rounding_adjustment > 0:
+        text_value += f" - {format_money(quote.rounding_adjustment)} courtesy rounding"
+    elif quote.rounding_adjustment < 0:
+        text_value += f" + {format_money(-quote.rounding_adjustment)} price adjustment"
+    return f"{text_value} = {format_money(quote.total)}"
+
+
 def customer_quote_view(quote: Quote) -> dict:
     """The quote as it may be shown to a customer (no costs or margins)."""
     next_tier = next(
         ((units, rate) for units, rate in reversed(BULK_DISCOUNT_TIERS) if units > quote.total_units),
         None,
     )
+    lines = []
+    for q in quote.lines:
+        line = {
+            "item": q.catalog_item,
+            "requested_as": q.customer_description,
+            "quantity": q.quantity_text,
+            "unit_price": q.unit_price_text,
+            "line_subtotal": format_money(q.line_subtotal),
+            "line_subtotal_calculation": q.subtotal_calculation,
+        }
+        if q.package_unit:
+            line["quantity_conversion"] = q.quantity_note
+            line["equivalent_price"] = q.package_price_text
+        lines.append(line)
     return {
-        "lines": [
-            {
-                "item": q.catalog_item,
-                "requested_as": q.customer_description,
-                "quantity": q.quantity,
-                "unit_price": format_unit_price(q.list_unit_price),
-                "line_subtotal": format_money(q.line_subtotal),
-            }
-            for q in quote.lines
-        ],
+        "lines": lines,
         "total_units": quote.total_units,
         "subtotal": format_money(quote.subtotal),
         "bulk_discount": f"{quote.discount_rate:.0%}",
         "bulk_discount_amount": format_money(quote.discount_amount),
+        "bulk_discount_calculation": discount_calculation(quote),
         "rounding_courtesy_discount": format_money(quote.rounding_adjustment),
         "total": format_money(quote.total),
+        "total_calculation": total_calculation(quote),
         "discount_policy": "5% from 500 units, 10% from 2,000 units, 15% from 10,000 units (whole order).",
         "next_discount_tier": (
             f"{next_tier[1]:.0%} off from {next_tier[0]:,} units" if next_tier else "highest tier reached"
@@ -1163,8 +1251,8 @@ def customer_assessment_view(order: OrderContext) -> list[dict]:
             "line": line.line_id,
             "requested_as": line.customer_description,
             "matched_item": line.catalog_item or "no matching product",
-            "quantity": line.quantity,
-            "quantity_note": line.quantity_note,
+            "quantity": line.quantity_text,
+            "quantity_conversion": line.quantity_note,
             "status": CUSTOMER_STATUS_LABELS.get(line.status, line.status),
             "estimated_delivery": line.estimated_delivery if line.is_fulfillable else None,
             "explanation": line.customer_reason,
@@ -1282,18 +1370,26 @@ def render_customer_summary(order: OrderContext) -> str:
         parts.append("We were unable to complete the automatic processing of your request. "
                      "A member of our team will review it and contact you shortly with availability and pricing.")
         return "\n".join(parts)
+    quote_is_offered = order.sale is not None or (order.quote and order.customer_intent == "quote_only")
     if order.sale:
         parts.append(f"Your order {order.sale.order_reference} is confirmed.")
+    elif quote_is_offered:
+        parts.append("Here is your quote.")
+    if quote_is_offered:
         for quote_line in order.quote.lines:
-            parts.append(
-                f"- {quote_line.quantity:,} x {quote_line.catalog_item} at "
-                f"{format_unit_price(quote_line.list_unit_price)} each = {format_money(quote_line.line_subtotal)}"
-            )
-        if order.quote.discount_rate:
-            parts.append(f"A {order.quote.discount_rate:.0%} bulk discount was applied for {order.quote.total_units:,} units.")
-        parts.append(f"Total: {format_money(order.quote.total)}. Estimated delivery: {order.sale.delivery_date}.")
-    elif order.quote and order.customer_intent == "quote_only":
-        parts.append(f"Your quote total is {format_money(order.quote.total)}.")
+            parts.append(f"- {quote_line.catalog_item} (requested as '{quote_line.customer_description}'):")
+            if quote_line.package_unit:
+                parts.append(f"  Quantity: {quote_line.quantity_note}")
+                parts.append(f"  Price: {quote_line.unit_price_text} (equivalent to {quote_line.package_price_text})")
+            else:
+                parts.append(f"  Quantity: {quote_line.quantity_text}")
+                parts.append(f"  Price: {quote_line.unit_price_text}")
+            parts.append(f"  Line subtotal: {quote_line.subtotal_calculation}")
+        parts.append(f"Subtotal: {format_money(order.quote.subtotal)}")
+        parts.append(f"Bulk discount: {discount_calculation(order.quote)}")
+        parts.append(f"Total: {total_calculation(order.quote)}")
+    if order.sale:
+        parts.append(f"Estimated delivery: {order.sale.delivery_date}.")
     for line in order.unfulfillable_lines:
         parts.append(f"- Unable to supply '{line.customer_description}': {line.customer_reason}")
     if not order.sale and not order.quote:
@@ -1344,9 +1440,14 @@ CATALOG:
 
 FINAL REPLY RULES:
 - Address the customer politely; summarise every requested item and what happens to it.
-- For confirmed orders include: the order reference, each item with quantity, unit price and line
-  subtotal, the bulk discount and why it applies, the total exactly as given by the quote
-  (e.g. "$1,234.00"), and the estimated delivery date.
+- For confirmed orders and quotes include: the order reference (if confirmed), and for each item its
+  quantity, its unit price WITH the price basis exactly as given (e.g. "$0.05 per sheet"), and the
+  line subtotal calculation exactly as given (e.g. "250,000 sheets x $0.05 per sheet = $12,500.00").
+- If an item was requested in reams, boxes or packs, also show the `quantity_conversion` exactly as
+  given (e.g. "500 reams x 500 sheets per ream = 250,000 sheets") and the `equivalent_price`
+  (e.g. "$25.00 per ream"), so the customer can verify the line subtotal.
+- Then show the subtotal, the bulk discount calculation and why it applies, the total calculation
+  and the total exactly as given by the quote (e.g. "$1,234.00"), and the estimated delivery date.
 - For items that cannot be supplied, give the reason provided by the inventory agent and, where
   helpful, an alternative (e.g. a reduced quantity or later date).
 - Never reveal internal information: costs, margins, markups, cash or financial figures, stock
@@ -1386,7 +1487,9 @@ Steps:
    bulk discount tiers, courtesy rounding) is applied by the tool - never change its numbers.
 3. Reply with a 2-4 sentence customer-friendly explanation of the price: mention the bulk
    discount and why it applies (or how many more units would unlock the next tier), the
-   courtesy rounding, and how it compares to similar past orders if relevant.
+   courtesy rounding, and how it compares to similar past orders if relevant. Paper is priced
+   per sheet: when an item was ordered in reams/boxes/packs, say so and quote the conversion
+   and equivalent package price returned by the tool.
    Never mention costs, margins, markups or internal policies beyond the discount tiers.
 """
 
@@ -1739,7 +1842,8 @@ async def delegate_to_quoting_agent(ctx: RunContext[OrderContext]) -> str:
         return to_json({"quote": customer_quote_view(order.quote), "pricing_explanation": order.quote_explanation})
     tracer.handoff("Orchestrator", "Quoting Agent", "price the order")
     lines_text = "\n".join(
-        f"- {line.quantity:,} x {line.catalog_item} (requested as '{line.customer_description}')"
+        f"- {line.quantity_text} of {line.catalog_item} (requested as '{line.customer_description}'"
+        + (f"; {line.quantity_note}" if line.package_unit else "") + ")"
         for line in order.fulfillable_lines
     )
     result = await quoting_agent.run(
@@ -1828,16 +1932,24 @@ def validate_customer_reply(ctx: RunContext[OrderContext], reply: str) -> str:
         raise ModelRetry(f"Remove the placeholder {placeholder.group(0)}; sign as the Sales Team.")
     if order.sale and order.sale.order_reference not in reply:
         raise ModelRetry(f"Include the order reference {order.sale.order_reference} in the reply.")
-    if order.sale:
-        missing_prices = [
-            f"{q.catalog_item} ({format_unit_price(q.list_unit_price)})"
-            for q in order.quote.lines if format_unit_price(q.list_unit_price) not in reply
-        ]
-        if missing_prices:
-            raise ModelRetry("List every confirmed item with its unit price and line subtotal; missing: "
-                             + ", ".join(missing_prices))
-    quote_is_offered = order.sale is not None or order.customer_intent == "quote_only"
-    if order.quote and quote_is_offered and format_money(order.quote.total) not in reply:
+    quote_is_offered = order.quote is not None and (order.sale is not None or order.customer_intent == "quote_only")
+    if not quote_is_offered:
+        return reply
+
+    missing = []
+    for q in order.quote.lines:
+        required = [q.unit_price_text, format_money(q.line_subtotal)]
+        if q.package_unit:
+            required += [q.per_package_text, q.quantity_text, q.package_price_text]
+        missing += [f"{q.catalog_item}: '{phrase}'" for phrase in required if phrase not in reply]
+    if missing:
+        raise ModelRetry(
+            "For every quoted item show the quantity conversion (for reams/boxes/packs), the unit price "
+            "with its basis and the line subtotal calculation exactly as given by the quote. Missing: "
+            + "; ".join(missing))
+    if order.quote.discount_amount and format_money(order.quote.discount_amount) not in reply:
+        raise ModelRetry(f"Show the bulk discount amount {format_money(order.quote.discount_amount)}.")
+    if format_money(order.quote.total) not in reply:
         raise ModelRetry(f"State the total exactly as {format_money(order.quote.total)}.")
     return reply
 
